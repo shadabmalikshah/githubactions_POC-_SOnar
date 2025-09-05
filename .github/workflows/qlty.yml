@@ -1,53 +1,151 @@
-name: Qlty Analysis
+name: Qlty Analysis (Java)
 
 on:
   push:
-    branches: [ "main" ]
+    branches: ["main"]
   pull_request:
-    branches: [ "main" ]
+    branches: ["main"]
 
 permissions:
   contents: read
-  id-token: write
+  id-token: write     # needed if you prefer OIDC-based Qlty auth for some flows
 
 jobs:
   qlty-check:
     runs-on: ubuntu-latest
+    env:
+      # token used to upload coverage to Qlty Cloud (set as a repo secret)
+      QLTY_COVERAGE_TOKEN: ${{ secrets.QLTY_COVERAGE_TOKEN }}
 
     steps:
-      # Step 1: Checkout code
       - name: Checkout repository
         uses: actions/checkout@v4
-
-      # Step 2: Setup Node.js
-      - name: Set up Node.js
-        uses: actions/setup-node@v4
         with:
-          node-version: '20.x'
+          fetch-depth: 0
 
-      # Step 3: Install dependencies
-      - name: Install dependencies
-        run: npm install
-
-      # Step 4: Run tests with coverage (nyc will generate coverage/lcov.info)
-      - name: Run tests with coverage
-        run: npm test
-
-      # Step 5: Debug coverage (useful if upload fails)
-      - name: Debug coverage files
-        run: ls -R coverage || true
-
-      # Step 6: Upload coverage to Qlty dashboard
-      - name: Upload coverage to Qlty
-        uses: qltysh/qlty-action/coverage@v2
+      # ---------- Java toolchain ----------
+      - name: Set up JDK 17
+        uses: actions/setup-java@v4
         with:
-          token: ${{ secrets.QLTY_COVERAGE_TOKEN }}
-          files: coverage/lcov.info
+          distribution: 'temurin'
+          java-version: '17'
 
-      # Step 7: Install Qlty CLI
+      # ---------- Cache dependencies (optional speedup) ----------
+      - name: Cache Maven local repository
+        if: filesExists('pom.xml')
+        uses: actions/cache@v4
+        with:
+          path: ~/.m2/repository
+          key: maven-repo-${{ runner.os }}-${{ hashFiles('**/pom.xml') }}
+          restore-keys: |
+            maven-repo-${{ runner.os }}-
+
+      - name: Cache Gradle
+        if: filesExists('build.gradle') || filesExists('build.gradle.kts')
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.gradle/caches
+            ~/.gradle/wrapper
+          key: gradle-cache-${{ runner.os }}-${{ hashFiles('**/build.gradle*', '**/settings.gradle*') }}
+          restore-keys: |
+            gradle-cache-${{ runner.os }}-
+
+      # ---------- Build & run tests with coverage ----------
+      - name: Build & run tests (Maven or Gradle)
+        id: build_tests
+        run: |
+          set -euo pipefail
+
+          # detect build system and run appropriate commands that produce JaCoCo xml
+          if [ -f "pom.xml" ]; then
+            echo "Detected Maven build."
+            # run tests and generate JaCoCo report
+            mvn --batch-mode clean test jacoco:report
+            # common Maven jacoco xml paths
+            echo "coverage_path=target/site/jacoco/jacoco.xml" >> $GITHUB_OUTPUT
+          elif [ -f "build.gradle" ] || [ -f "build.gradle.kts" ]; then
+            echo "Detected Gradle build."
+            # ensure wrapper exists (if not, developer should add or use ./gradlew)
+            if [ -f "gradlew" ]; then
+              ./gradlew --no-daemon clean test jacocoTestReport
+            else
+              # try with system gradle
+              gradle clean test jacocoTestReport
+            fi
+            # common Gradle jacoco xml paths
+            # Gradle jacoco plugin writes XML at build/reports/jacoco/test/jacocoTestReport.xml usually
+            echo "coverage_path=build/reports/jacoco/test/jacocoTestReport.xml" >> $GITHUB_OUTPUT
+          else
+            echo "No Maven (pom.xml) or Gradle (build.gradle) found. Exiting."
+            echo "coverage_path=" >> $GITHUB_OUTPUT
+            exit 0
+          fi
+
+      # ---------- Debug: show files so we can see where the report landed ----------
+      - name: Show possible coverage files (debug)
+        run: |
+          echo "Listing candidate coverage files..."
+          ls -la target/site/jacoco  || true
+          ls -la target || true
+          ls -la build/reports/jacoco/test || true
+          ls -la build || true
+          find . -type f -name "jacoco*.xml" -o -name "jacoco*.exec" -o -name "jacoco*.report" || true
+
+      # ---------- Install Qlty CLI (official action) ----------
       - name: Install Qlty CLI
         uses: qltysh/qlty-action/install@v2
 
-      # Step 8: Run Qlty checks (SCA, Maintainability, Duplication, Formatting)
-      - name: Run Qlty checks
-        run: qlty check --all --verbose
+      # ---------- Find the actual Jacoco XML file (set output) ----------
+      - name: Find jacoco xml
+        id: find_jacoco
+        run: |
+          set -euo pipefail
+          # Candidate file list (common places)
+          CANDIDATES=(
+            "target/site/jacoco/jacoco.xml"
+            "target/site/jacoco/index.xml"
+            "target/jacoco.xml"
+            "build/reports/jacoco/test/jacocoTestReport.xml"
+            "build/jacoco/test/jacocoTestReport.xml"
+            "build/reports/jacoco/jacoco.xml"
+          )
+          FOUND=""
+          for f in "${CANDIDATES[@]}"; do
+            if [ -f "$f" ]; then
+              FOUND="$f"
+              break
+            fi
+          done
+
+          # try a generic search fallback
+          if [ -z "$FOUND" ]; then
+            FOUND=$(find . -type f -name "jacoco*.xml" -print -quit || true)
+          fi
+
+          if [ -z "$FOUND" ]; then
+            echo "No JaCoCo XML coverage file found."
+            echo "coverage_file=" >> $GITHUB_OUTPUT
+            exit 0
+          fi
+
+          echo "Found coverage file: $FOUND"
+          echo "coverage_file=$FOUND" >> $GITHUB_OUTPUT
+
+      # ---------- Upload coverage to Qlty (if found) ----------
+      - name: Upload coverage to Qlty (jacoco)
+        if: steps.find_jacoco.outputs.coverage_file != ''
+        run: |
+          echo "Uploading coverage file to Qlty: ${{ steps.find_jacoco.outputs.coverage_file }}"
+          # Use the CLI (already installed by qlty install action) to publish coverage
+          qlty coverage publish "${{ steps.find_jacoco.outputs.coverage_file }}" --token "${QLTY_COVERAGE_TOKEN}" --format jacoco --verbose
+
+      - name: Upload coverage debug (no file found)
+        if: steps.find_jacoco.outputs.coverage_file == ''
+        run: echo "Skipping coverage upload: no jacoco xml found."
+
+      # ---------- Run Qlty full checks (ensure qlty installed) ----------
+      - name: Run Qlty checks (SCA, Linting, Duplication, Formatting, IaC, etc.)
+        run: |
+          # prints more verbose logs
+          qlty check --all --verbose
